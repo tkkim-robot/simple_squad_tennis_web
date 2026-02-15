@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Annarbor Tennis Club</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Manrope:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body class="auth-body">
+  <main class="auth-shell">
+    <section class="auth-panel">
+      <img src="{{ url_for('static', filename='um_tennis_logo.svg') }}" alt="Annarbor Tennis" class="auth-logo" />
+      <h1>Annarbor Tennis Club</h1>
+      <p>Club scheduling, squad management, and matchup planning.</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-wrap">
+          {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+      {% endwith %}
+
+      {% if mode == 'signup' %}
+      <form method="post" class="stack-form">
+        <label>Username<input type="text" name="username" required /></label>
+        <label>Password<input type="password" name="password" required /></label>
+        <label>Display Name<input type="text" name="display_name" required /></label>
+        <button type="submit">Create Account</button>
+      </form>
+      <p class="switch-link">Already have an account? <a href="{{ url_for('web.login') }}">Sign in</a></p>
+      {% else %}
+      <form method="post" class="stack-form">
+        <label>Username<input type="text" name="username" required /></label>
+        <label>Password<input type="password" name="password" required /></label>
+        <button type="submit">Sign In</button>
+      </form>
+      <p class="switch-link">Need an account? <a href="{{ url_for('web.signup') }}">Create one</a></p>
+      <p class="hint">Admin account: <code>admin</code> / <code>annarbor</code></p>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

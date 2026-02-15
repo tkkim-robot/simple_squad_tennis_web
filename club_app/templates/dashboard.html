@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Annarbor Tennis Club</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Manrope:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="{{ url_for('static', filename='um_tennis_logo.svg') }}" alt="Annarbor Tennis Logo" class="logo" />
+      <div>
+        <h1>Annarbor Tennis Club</h1>
+        <p>Now: {{ now }}</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="badge">{{ user.username }}{% if user.is_admin %} (admin){% endif %}</div>
+      <form action="{{ url_for('web.logout') }}" method="post">
+        <button type="submit" class="secondary">Logout</button>
+      </form>
+    </div>
+  </header>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+  <section class="flash-wrap page-wrap">
+    {% for category, message in messages %}
+    <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  </section>
+  {% endif %}
+  {% endwith %}
+
+  <main class="page-wrap">
+    {% if open_appointment %}
+    {% set live_joined = open_appointment.votes | selectattr('will_join') | map(attribute='member.name') | list %}
+    <section class="card vote-focus">
+      <h2>Live Vote Window</h2>
+      <p><strong>{{ open_appointment.title }}</strong> | {{ open_appointment.event_start }} - {{ open_appointment.event_end }}</p>
+      <p>Vote closes at <strong>{{ open_appointment.vote_close_at }}</strong>. Current joined count: <strong>{{ live_joined|length + (open_appointment.guests | selectattr('active') | list | length) }}</strong></p>
+      {% if user.member %}
+      <div class="inline-group">
+        <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=open_appointment.id) }}" class="inline-form">
+          <input type="hidden" name="will_join" value="1" />
+          <button type="submit">I will join</button>
+        </form>
+        <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=open_appointment.id) }}" class="inline-form">
+          <input type="hidden" name="will_join" value="0" />
+          <button type="submit" class="secondary">I cannot join</button>
+        </form>
+      </div>
+      {% endif %}
+      <p class="muted">Live voters: {{ live_joined | join(', ') if live_joined else 'No votes yet' }}</p>
+    </section>
+    {% endif %}
+
+    {% if active_result_plan %}
+    <section class="card results-focus">
+      <h2>Tuesday Night Match Results</h2>
+      <p><strong>Plan #{{ active_result_plan.id }}</strong> for {{ active_result_plan.appointment.event_start.date() }} | Window: {{ active_result_open_at }} to {{ active_result_close_at }}</p>
+      <p class="muted">Each user can enter/edit results independently. Ranking updates are applied automatically after Wednesday 9:00 AM.</p>
+
+      <form method="post" action="{{ url_for('web.input_match_results', plan_id=active_result_plan.id) }}" class="stack-form">
+        {% for game in active_result_plan.games %}
+        {% set prev_score = active_result_user_inputs.get(game.id) %}
+        <div class="score-row">
+          <span class="score-title">Game {{ game.game_index }} Court {{ game.court_index }}<br>{{ game.team_a_p1.display_name }}/{{ game.team_a_p2.display_name }} vs {{ game.team_b_p1.display_name }}/{{ game.team_b_p2.display_name }}</span>
+          <input name="game_{{ game.id }}_a" type="number" min="0" placeholder="A" value="{{ prev_score[0] if prev_score else '' }}" />
+          <input name="game_{{ game.id }}_b" type="number" min="0" placeholder="B" value="{{ prev_score[1] if prev_score else '' }}" />
+        </div>
+        {% endfor %}
+        <button type="submit">Save My Results</button>
+      </form>
+    </section>
+    {% endif %}
+
+    <nav class="tabs" data-active-tab="{{ active_tab }}">
+      <button type="button" data-tab="squad">Squad</button>
+      <button type="button" data-tab="appointments">Appointments</button>
+      <button type="button" data-tab="matchmaking">Match Making</button>
+      <button type="button" data-tab="leaderboard">Leaderboard</button>
+      {% if user.is_admin %}
+      <button type="button" data-tab="settings">Settings</button>
+      {% endif %}
+    </nav>
+
+    <section class="tab-panel" id="tab-squad">
+      <h2>Squad Members</h2>
+      <p class="muted">Admin can add, edit, disable, or delete members. All counters are persisted in DB and recalculated safely.</p>
+
+      {% if user.is_admin %}
+      <details class="card">
+        <summary>Add Member</summary>
+        <form method="post" action="{{ url_for('web.add_member') }}" class="grid-form">
+          <label>Name<input name="name" required /></label>
+          <label>Email<input name="email" /></label>
+          <label>Phone<input name="phone" /></label>
+          <label>Skill Rating<input name="skill_rating" type="number" step="0.1" value="1000" /></label>
+          <label class="checkbox"><input name="active" type="checkbox" checked /> Active</label>
+          <label class="full">Notes<textarea name="notes"></textarea></label>
+          <button type="submit">Add Member</button>
+        </form>
+      </details>
+      {% endif %}
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Phone</th>
+              <th>Skill</th>
+              <th>Ball Wait</th>
+              <th>Reserve Wait</th>
+              <th>Active</th>
+              <th>Notes</th>
+              {% if user.is_admin %}<th>Admin</th>{% endif %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for member in members %}
+            <tr>
+              <td>{{ member.name }}</td>
+              <td>{{ member.email }}</td>
+              <td>{{ member.phone }}</td>
+              <td>{{ '%.1f'|format(member.skill_rating) }}</td>
+              <td>{{ member.ball_wait_count }}</td>
+              <td>{{ member.reserver_wait_count }}</td>
+              <td>{{ 'Yes' if member.active else 'No' }}</td>
+              <td>{{ member.notes }}</td>
+              {% if user.is_admin %}
+              <td>
+                <details>
+                  <summary>Edit</summary>
+                  <form method="post" action="{{ url_for('web.update_member', member_id=member.id) }}" class="stack-form compact">
+                    <label>Name<input name="name" value="{{ member.name }}" /></label>
+                    <label>Email<input name="email" value="{{ member.email or '' }}" /></label>
+                    <label>Phone<input name="phone" value="{{ member.phone or '' }}" /></label>
+                    <label>Skill Rating<input name="skill_rating" type="number" step="0.1" value="{{ member.skill_rating }}" /></label>
+                    <label class="checkbox"><input name="active" type="checkbox" {% if member.active %}checked{% endif %} /> Active</label>
+                    <label>Notes<textarea name="notes">{{ member.notes or '' }}</textarea></label>
+                    <button type="submit">Save</button>
+                  </form>
+                  <form method="post" action="{{ url_for('web.delete_member', member_id=member.id) }}" class="inline-form">
+                    <button type="submit" class="danger">Delete</button>
+                  </form>
+                </details>
+              </td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-appointments">
+      {% if upcoming_appointment %}
+      {% set up_joined_members = upcoming_appointment.votes | selectattr('will_join') | map(attribute='member.name') | list %}
+      {% set up_ball_roles = upcoming_appointment.role_assignments | selectattr('role_type', 'equalto', 'BALL_CARRIER') | map(attribute='member.name') | list %}
+      {% set up_reserve_roles = upcoming_appointment.role_assignments | selectattr('role_type', 'equalto', 'RESERVER') | map(attribute='member.name') | list %}
+      <article class="card appointment-card upcoming-card">
+        <header>
+          <h3>Upcoming Appointment: {{ upcoming_appointment.title }}</h3>
+          <span class="status status-{{ upcoming_appointment.status|lower }}">{{ upcoming_appointment.status }}</span>
+        </header>
+        <p><strong>Event:</strong> {{ upcoming_appointment.event_start }} - {{ upcoming_appointment.event_end }}</p>
+        <p><strong>Vote Window:</strong> {{ upcoming_appointment.vote_open_at }} to {{ upcoming_appointment.vote_close_at }}</p>
+        <p><strong>Joined:</strong> {{ upcoming_appointment.joined_count }} | <strong>Courts:</strong> {{ upcoming_appointment.courts_reserved }}</p>
+        <p><strong>Ball Carriers:</strong> {{ up_ball_roles | join(', ') if up_ball_roles else 'TBD' }}</p>
+        <p><strong>Reservers:</strong> {{ up_reserve_roles | join(', ') if up_reserve_roles else 'TBD' }}</p>
+        {% if user.member and upcoming_appointment.status == 'OPEN' %}
+        <div class="inline-group">
+          <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=upcoming_appointment.id) }}" class="inline-form">
+            <input type="hidden" name="will_join" value="1" />
+            <button type="submit">I will join</button>
+          </form>
+          <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=upcoming_appointment.id) }}" class="inline-form">
+            <input type="hidden" name="will_join" value="0" />
+            <button type="submit" class="secondary">I cannot join</button>
+          </form>
+        </div>
+        {% endif %}
+      </article>
+      {% endif %}
+
+      <div class="panel-header">
+        <h2>Appointments</h2>
+        <div class="panel-actions">
+          <input id="appointment-search" placeholder="Search by date, status, or member" />
+          <label class="checkbox"><input id="hide-finished" type="checkbox" /> Hide completed/canceled</label>
+        </div>
+      </div>
+      <p class="muted">Weekly auto-creation, vote window, role selection, and counter logic are all DB-driven.</p>
+
+      {% if user.is_admin %}
+      <div class="inline-group">
+        <form method="post" action="{{ url_for('web.admin_run_maintenance') }}" class="inline-form"><button type="submit">Run Maintenance</button></form>
+        <form method="post" action="{{ url_for('web.admin_recompute') }}" class="inline-form"><button type="submit" class="secondary">Recompute Counters/Roles</button></form>
+      </div>
+      {% endif %}
+
+      <div id="appointments-list" class="cards-grid">
+        {% for appt in appointments %}
+        {% if appt.id != upcoming_appointment_id %}
+        {% set joined_members = appt.votes | selectattr('will_join') | map(attribute='member.name') | list %}
+        {% set ball_roles = appt.role_assignments | selectattr('role_type', 'equalto', 'BALL_CARRIER') | map(attribute='member.name') | list %}
+        {% set reserve_roles = appt.role_assignments | selectattr('role_type', 'equalto', 'RESERVER') | map(attribute='member.name') | list %}
+        <article class="card appointment-card" data-status="{{ appt.status }}" data-search="{{ appt.title }} {{ appt.status }} {{ appt.event_start.date() }} {{ joined_members | join(' ') }}">
+          <header>
+            <h3>{{ appt.title }}</h3>
+            <span class="status status-{{ appt.status|lower }}">{{ appt.status }}</span>
+          </header>
+          <p><strong>Event:</strong> {{ appt.event_start }} - {{ appt.event_end }}</p>
+          <p><strong>Vote closes:</strong> {{ appt.vote_close_at }}</p>
+          <p><strong>Joined:</strong> {{ appt.joined_count }} | <strong>Courts:</strong> {{ appt.courts_reserved }}</p>
+          <p><strong>Ball Carriers:</strong> {{ ball_roles | join(', ') if ball_roles else 'TBD' }}</p>
+          <p><strong>Reservers:</strong> {{ reserve_roles | join(', ') if reserve_roles else 'TBD' }}</p>
+
+          <details>
+            <summary>Details</summary>
+            <p><strong>Joined Members:</strong> {{ joined_members | join(', ') if joined_members else 'None' }}</p>
+
+            <div class="votes-grid">
+              {% for vote in appt.votes | sort(attribute='member.name') %}
+              <div class="vote-pill {{ 'join' if vote.will_join else 'skip' }}">{{ vote.member.name }}: {{ 'Join' if vote.will_join else 'No' }}</div>
+              {% endfor %}
+            </div>
+
+            {% if appt.guests %}
+            <h4>Guests</h4>
+            <ul class="simple-list">
+              {% for guest in appt.guests %}
+              <li>
+                {{ guest.name }} (closest: {{ guest.closest_member.name }}) - {{ 'Active' if guest.active else 'Disabled' }}
+                {% if user.is_admin %}
+                <form method="post" action="{{ url_for('web.toggle_guest', appointment_id=appt.id, guest_id=guest.id) }}" class="inline-form">
+                  <button type="submit" class="secondary">Toggle</button>
+                </form>
+                {% endif %}
+              </li>
+              {% endfor %}
+            </ul>
+            {% endif %}
+
+            {% if user.is_admin %}
+            <form method="post" action="{{ url_for('web.add_guest', appointment_id=appt.id) }}" class="grid-form compact card-subsection">
+              <h4>Add Guest</h4>
+              <label>Guest Name<input name="name" required /></label>
+              <label>Closest Skill Member
+                <select name="closest_member_id" required>
+                  {% for member in members if member.active %}
+                  <option value="{{ member.id }}">{{ member.name }} ({{ '%.0f'|format(member.skill_rating) }})</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <button type="submit">Add Guest</button>
+            </form>
+            {% endif %}
+          </details>
+
+          {% if user.member and appt.status == 'OPEN' %}
+          <div class="inline-group">
+            <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=appt.id) }}" class="inline-form">
+              <input type="hidden" name="will_join" value="1" />
+              <button type="submit">I will join</button>
+            </form>
+            <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=appt.id) }}" class="inline-form">
+              <input type="hidden" name="will_join" value="0" />
+              <button type="submit" class="secondary">I cannot join</button>
+            </form>
+          </div>
+          {% endif %}
+        </article>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-matchmaking">
+      <h2>Match Making (Doubles, 3 Games)</h2>
+      <p class="muted">Uses open-source OR-Tools CP-SAT optimizer with history-aware fairness penalties and guest one-game limits.</p>
+
+      {% if active_result_plan %}
+      <article class="card">
+        <h3>Result Input Window (Tue 8pm - Wed 9am)</h3>
+        <p>Plan #{{ active_result_plan.id }} for {{ active_result_plan.appointment.event_start.date() }} is currently open for independent result entry.</p>
+        <form method="post" action="{{ url_for('web.input_match_results', plan_id=active_result_plan.id) }}" class="stack-form">
+          {% for game in active_result_plan.games %}
+          {% set prev_score = active_result_user_inputs.get(game.id) %}
+          <div class="score-row">
+            <span class="score-title">Game {{ game.game_index }} Court {{ game.court_index }}<br>{{ game.team_a_p1.display_name }}/{{ game.team_a_p2.display_name }} vs {{ game.team_b_p1.display_name }}/{{ game.team_b_p2.display_name }}</span>
+            <input name="game_{{ game.id }}_a" type="number" min="0" placeholder="A" value="{{ prev_score[0] if prev_score else '' }}" />
+            <input name="game_{{ game.id }}_b" type="number" min="0" placeholder="B" value="{{ prev_score[1] if prev_score else '' }}" />
+          </div>
+          {% endfor %}
+          <button type="submit">Save My Results</button>
+        </form>
+      </article>
+      {% endif %}
+
+      {% if user.is_admin %}
+      <form method="post" action="{{ url_for('web.generate_matchmaking_plan') }}" class="inline-form">
+        <label>Appointment
+          <select name="appointment_id" required>
+            <option value="">Select appointment</option>
+            {% for appt in appointments if appt.joined_count >= 4 %}
+            <option value="{{ appt.id }}">{{ appt.title }} ({{ appt.joined_count }} joined)</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button type="submit">Generate Match Plan</button>
+      </form>
+      {% endif %}
+
+      {% for plan in match_plans %}
+      <article class="card">
+        <header>
+          <h3>Plan #{{ plan.id }} | {{ plan.event_date }}</h3>
+          <small>{{ plan.notes }}</small>
+        </header>
+
+        {% for game_no, grouped in plan.games|groupby('game_index') %}
+        <h4>Game {{ game_no }}</h4>
+        <div class="table-wrap">
+          <table class="match-table">
+            <thead><tr><th>Court</th><th>Team A</th><th>Team B</th><th>Score</th></tr></thead>
+            <tbody>
+              {% for game in grouped %}
+              <tr>
+                <td class="court-cell">Court {{ game.court_index }}</td>
+                <td class="team-cell"><span>{{ game.team_a_p1.display_name }}</span><span>/</span><span>{{ game.team_a_p2.display_name }}</span></td>
+                <td class="team-cell"><span>{{ game.team_b_p1.display_name }}</span><span>/</span><span>{{ game.team_b_p2.display_name }}</span></td>
+                <td class="score-cell">
+                  {% if game.team_a_score is not none and game.team_b_score is not none %}
+                    {{ game.team_a_score }} - {{ game.team_b_score }}
+                  {% else %}
+                    Pending
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        {% set practices = plan.practices | selectattr('game_index', 'equalto', game_no) | list %}
+        <p><strong>Practice Group:</strong> {{ practices | map(attribute='participant.display_name') | join(', ') if practices else 'None' }}</p>
+        {% endfor %}
+
+        {% if plan.id in ratings_applied_plan_ids %}
+        <p class="muted"><strong>Ranking status:</strong> Applied (after result window close).</p>
+        {% else %}
+        <p class="muted"><strong>Ranking status:</strong> Pending result-window close.</p>
+        {% endif %}
+      </article>
+      {% else %}
+      <p>No match plans generated yet.</p>
+      {% endfor %}
+    </section>
+
+    <section class="tab-panel" id="tab-leaderboard">
+      <h2>Leaderboard</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>#</th><th>Member</th><th>Rating</th><th>Ball Wait</th><th>Reserve Wait</th></tr>
+          </thead>
+          <tbody>
+            {% for member in leaderboard %}
+            <tr>
+              <td>{{ loop.index }}</td>
+              <td>{{ member.name }}</td>
+              <td>{{ '%.1f'|format(member.skill_rating) }}</td>
+              <td>{{ member.ball_wait_count }}</td>
+              <td>{{ member.reserver_wait_count }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Recent Rating Events</h3>
+      <ul class="simple-list">
+        {% for event in recent_rating_events %}
+        <li>{{ event.created_at }} | {{ event.member.name }} | {{ '%+.2f'|format(event.delta) }} -> {{ '%.1f'|format(event.new_rating) }} ({{ event.note }})</li>
+        {% else %}
+        <li>No rating events yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    {% if user.is_admin %}
+    <section class="tab-panel" id="tab-settings">
+      <h2>Settings & QA Time Controls</h2>
+      <p class="muted">Use <code>qa_now_iso</code> to simulate dates/times for QA. Format: <code>YYYY-MM-DDTHH:MM:SS</code>.</p>
+      <form method="post" action="{{ url_for('web.update_settings') }}" class="grid-form">
+        <label>Auto Backfill Weeks<input name="auto_backfill_weeks" type="number" min="0" max="52" value="{{ settings.auto_backfill_weeks }}" /></label>
+        <label>Auto Lookahead Weeks<input name="auto_lookahead_weeks" type="number" min="1" max="52" value="{{ settings.auto_lookahead_weeks }}" /></label>
+        <label>Creation Weekday (Mon=0)<input name="creation_weekday" type="number" min="0" max="6" value="{{ settings.creation_weekday }}" /></label>
+        <label>Creation Hour<input name="creation_hour" type="number" min="0" max="23" value="{{ settings.creation_hour }}" /></label>
+        <label>Creation Minute<input name="creation_minute" type="number" min="0" max="59" value="{{ settings.creation_minute }}" /></label>
+
+        <label>Target Weekday<input name="target_weekday" type="number" min="0" max="6" value="{{ settings.target_weekday }}" /></label>
+        <label>Target Occurrence<input name="target_occurrence" type="number" min="1" max="4" value="{{ settings.target_occurrence }}" /></label>
+        <label>Event Start Hour<input name="event_start_hour" type="number" min="0" max="23" value="{{ settings.event_start_hour }}" /></label>
+
+        <label>Event Start Minute<input name="event_start_minute" type="number" min="0" max="59" value="{{ settings.event_start_minute }}" /></label>
+        <label>Event Duration (minutes)<input name="event_duration_minutes" type="number" min="30" max="300" value="{{ settings.event_duration_minutes }}" /></label>
+
+        <label>Vote Close Weekday<input name="vote_close_weekday" type="number" min="0" max="6" value="{{ settings.vote_close_weekday }}" /></label>
+        <label>Vote Close Hour<input name="vote_close_hour" type="number" min="0" max="23" value="{{ settings.vote_close_hour }}" /></label>
+        <label>Vote Close Minute<input name="vote_close_minute" type="number" min="0" max="59" value="{{ settings.vote_close_minute }}" /></label>
+
+        <label>Min Players to Run<input name="min_players_to_run" type="number" min="2" max="20" value="{{ settings.min_players_to_run }}" /></label>
+        <label>Ball Carriers per Court<input name="ball_carriers_per_court" type="number" min="1" max="4" value="{{ settings.ball_carriers_per_court }}" /></label>
+        <label>Reservers per Court<input name="reservers_per_court" type="number" min="1" max="4" value="{{ settings.reservers_per_court }}" /></label>
+
+        <label>Notify Channel
+          <select name="notify_channel">
+            {% for opt in ['LOG', 'EMAIL', 'DISCORD'] %}
+            <option value="{{ opt }}" {% if settings.notify_channel == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Notify Target<input name="notify_target" value="{{ settings.notify_target }}" /></label>
+        <label>Discord Webhook<input name="discord_webhook" value="{{ settings.discord_webhook }}" /></label>
+
+        <label>SMTP Host<input name="smtp_host" value="{{ settings.smtp_host }}" /></label>
+        <label>SMTP Port<input name="smtp_port" value="{{ settings.smtp_port }}" /></label>
+        <label>SMTP User<input name="smtp_user" value="{{ settings.smtp_user }}" /></label>
+
+        <label>SMTP Password<input type="password" name="smtp_password" value="{{ settings.smtp_password }}" /></label>
+        <label>SMTP From<input name="smtp_from" value="{{ settings.smtp_from }}" /></label>
+        <label>QA Current Time<input name="qa_now_iso" value="{{ settings.qa_now_iso }}" placeholder="2026-01-01T18:00:00" /></label>
+
+        <label class="full">Court Rules JSON
+          <textarea name="court_rules_json" rows="5">{{ settings.pretty_json_court_rules }}</textarea>
+        </label>
+
+        <button type="submit">Save Settings</button>
+      </form>
+
+      <h3>Notification Outbox</h3>
+      <ul class="simple-list">
+        {% for item in notifications %}
+        <li>
+          {{ item.created_at }} | {{ item.status }} | {{ item.channel }} | <strong>{{ item.title }}</strong>
+          <details><summary>Body</summary><pre>{{ item.body }}</pre>{% if item.error %}<pre>{{ item.error }}</pre>{% endif %}</details>
+        </li>
+        {% else %}
+        <li>No notifications yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
