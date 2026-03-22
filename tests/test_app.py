@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -16,7 +16,11 @@ from club_app.models import (
     RoleAssignment,
     User,
 )
-from club_app.services.appointments import run_maintenance
+from club_app.services.appointments import (
+    get_appointment_participation,
+    is_voting_open_for_appointment,
+    run_maintenance,
+)
 from club_app.services.matchmaking import (
     finalize_due_match_results,
     generate_match_plan,
@@ -37,6 +41,11 @@ def app():
     )
     with app.app_context():
         yield app
+
+
+@pytest.fixture()
+def client(app):
+    return app.test_client()
 
 
 @pytest.fixture()
@@ -61,22 +70,47 @@ def _get_appointment_by_date(session, dt: datetime) -> Appointment:
     return session.query(Appointment).filter(Appointment.event_start == dt).one()
 
 
-def _set_vote(session, appointment_id: int, member_id: int, will_join: bool) -> None:
+def _mk_account_member(session, username: str, display_name: str, *, is_admin: bool = False) -> User:
+    user = User(username=username, password_hash="test", is_admin=is_admin)
+    session.add(user)
+    session.flush()
+    member = Member(
+        user_id=user.id,
+        name=display_name,
+        email="",
+        phone="",
+        skill_rating=1000.0,
+        active=True,
+        notes="",
+    )
+    session.add(member)
+    session.flush()
+    return user
+
+
+def _set_vote(
+    session,
+    appointment_id: int,
+    member_id: int,
+    will_join: bool,
+    when: datetime | None = None,
+) -> None:
     vote = (
         session.query(AppointmentVote)
         .filter_by(appointment_id=appointment_id, member_id=member_id)
         .one_or_none()
     )
     if vote is None:
-        session.add(
-            AppointmentVote(
-                appointment_id=appointment_id,
-                member_id=member_id,
-                will_join=will_join,
-            )
+        vote = AppointmentVote(
+            appointment_id=appointment_id,
+            member_id=member_id,
+            will_join=will_join,
         )
+        session.add(vote)
     else:
         vote.will_join = will_join
+    if when is not None:
+        vote.updated_at = when
 
 
 def test_admin_seeded(session):
@@ -160,6 +194,176 @@ def test_vote_recompute_and_ball_role_shift_on_cancel(session):
     )
     assert shifted_ball
     assert shifted_ball[0].member_id != previous_carrier_id
+
+
+def test_vote_waitlist_cuts_to_multiple_of_four_by_vote_time(session):
+    members = [_mk_member(session, name) for name in ["A", "B", "C", "D", "E"]]
+    creator_user = session.query(User).filter_by(username="admin").one()
+    session.commit()
+
+    _set_now(session, "2022-01-02T10:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    appt = _get_appointment_by_date(session, datetime(2022, 1, 11, 20, 0, 0))
+    base_time = datetime(2022, 1, 2, 10, 0, 0)
+    for idx, member in enumerate(members, start=1):
+        _set_vote(session, appt.id, member.id, True, base_time + timedelta(minutes=idx))
+    session.commit()
+
+    _set_now(session, "2022-01-03T19:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    session.refresh(appt)
+    participation = get_appointment_participation(appt)
+    assert appt.joined_count == 4
+    assert appt.courts_reserved == 1
+    assert participation.confirmed_names == ["A", "B", "C", "D"]
+    assert participation.waitlist_names == ["E"]
+
+    plan = generate_match_plan(session, appt.id, creator_user.id)
+    session.commit()
+    participant_names = sorted(p.display_name for p in plan.participants)
+    assert participant_names == ["A", "B", "C", "D"]
+
+
+def test_late_cancel_promotes_waitlist_and_notifies_admin(session, client):
+    actor = _mk_account_member(session, "alpha", "A")
+    members = [actor.member] + [_mk_member(session, name) for name in ["B", "C", "D", "E"]]
+    session.commit()
+
+    _set_now(session, "2022-01-02T10:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    appt = _get_appointment_by_date(session, datetime(2022, 1, 11, 20, 0, 0))
+    base_time = datetime(2022, 1, 2, 10, 0, 0)
+    for idx, member in enumerate(members, start=1):
+        _set_vote(session, appt.id, member.id, True, base_time + timedelta(minutes=idx))
+    session.commit()
+
+    _set_now(session, "2022-01-03T19:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    with client.session_transaction() as flask_session:
+        flask_session["user_id"] = actor.id
+
+    response = client.post(
+        f"/appointments/{appt.id}/vote",
+        data={"will_join": "0"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+
+    session.expire_all()
+    appt = session.get(Appointment, appt.id)
+    participation = get_appointment_participation(appt)
+    assert appt.joined_count == 4
+    assert appt.courts_reserved == 1
+    assert participation.confirmed_names == ["B", "C", "D", "E"]
+    assert participation.waitlist_names == []
+
+    outbox = (
+        session.query(NotificationOutbox)
+        .filter(NotificationOutbox.title.like("Late Participation Update%"))
+        .order_by(NotificationOutbox.created_at.desc())
+        .first()
+    )
+    assert outbox is not None
+    assert "Removed from confirmed: A" in outbox.body
+    assert "Promoted from waitlist: E" in outbox.body
+
+
+def test_admin_bulk_vote_edit_recomputes_closed_appointment(session, client):
+    admin = session.query(User).filter_by(username="admin").one()
+    members = [_mk_member(session, name) for name in ["A", "B", "C", "D", "E"]]
+    session.commit()
+
+    _set_now(session, "2022-01-02T10:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    appt = _get_appointment_by_date(session, datetime(2022, 1, 11, 20, 0, 0))
+    base_time = datetime(2022, 1, 2, 10, 0, 0)
+    for idx, member in enumerate(members[:4], start=1):
+        _set_vote(session, appt.id, member.id, True, base_time + timedelta(minutes=idx))
+    _set_vote(session, appt.id, members[4].id, False)
+    session.commit()
+
+    _set_now(session, "2022-01-03T19:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    with client.session_transaction() as flask_session:
+        flask_session["user_id"] = admin.id
+
+    response = client.post(
+        f"/appointments/{appt.id}/admin-votes",
+        data={
+            f"vote_{members[3].id}": "0",
+            f"vote_{members[4].id}": "1",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+
+    session.expire_all()
+    appt = session.get(Appointment, appt.id)
+    participation = get_appointment_participation(appt)
+    assert participation.confirmed_names == ["A", "B", "C", "E"]
+    assert appt.joined_count == 4
+    assert appt.courts_reserved == 1
+
+    outbox = (
+        session.query(NotificationOutbox)
+        .filter(NotificationOutbox.title.like("Late Participation Update%"))
+        .order_by(NotificationOutbox.created_at.desc())
+        .first()
+    )
+    assert outbox is not None
+    assert "Admin confirmed vote edits" in outbox.body
+    assert "Removed from confirmed: D" in outbox.body
+    assert "Confirmed now (4): A, B, C, E" in outbox.body
+
+
+def test_three_player_exception_keeps_one_court_and_allows_late_join(session):
+    members = [_mk_member(session, name) for name in ["A", "B", "C", "D"]]
+    session.commit()
+
+    _set_now(session, "2022-01-02T10:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    appt = _get_appointment_by_date(session, datetime(2022, 1, 11, 20, 0, 0))
+    base_time = datetime(2022, 1, 2, 10, 0, 0)
+    for idx, member in enumerate(members[:3], start=1):
+        _set_vote(session, appt.id, member.id, True, base_time + timedelta(minutes=idx))
+    session.commit()
+
+    _set_now(session, "2022-01-03T19:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    session.refresh(appt)
+    assert appt.status == "EXTENDED"
+    assert appt.joined_count == 3
+    assert appt.courts_reserved == 1
+    assert is_voting_open_for_appointment(appt, datetime(2022, 1, 4, 12, 0, 0)) is True
+
+    _set_now(session, "2022-01-04T12:00:00")
+    _set_vote(session, appt.id, members[3].id, True, datetime(2022, 1, 4, 12, 0, 0))
+    session.commit()
+    run_maintenance(session)
+    session.commit()
+
+    session.refresh(appt)
+    participation = get_appointment_participation(appt)
+    assert appt.status == "CLOSED"
+    assert appt.joined_count == 4
+    assert appt.courts_reserved == 1
+    assert participation.confirmed_names == ["A", "B", "C", "D"]
 
 
 def test_auto_match_plan_and_notification_on_vote_close(session):
@@ -326,14 +530,14 @@ def test_delayed_rating_apply_after_result_window_close(session):
     save_user_result_inputs(session, plan.id, creator_user.id, scores)
     session.commit()
 
-    # Before Wednesday 9am, ratings must not apply.
-    finalize_due_match_results(session, datetime(2022, 1, 12, 8, 30, 0))
+    # Before the one-day result window closes, ratings must not apply.
+    finalize_due_match_results(session, datetime(2022, 1, 12, 19, 30, 0))
     session.commit()
     before_events = session.query(RatingEvent).filter_by(match_plan_id=plan.id).count()
     assert before_events == 0
 
-    # After Wednesday 9am, ratings should apply.
-    finalize_due_match_results(session, datetime(2022, 1, 12, 9, 5, 0))
+    # After the result window closes, ratings should apply.
+    finalize_due_match_results(session, datetime(2022, 1, 12, 20, 5, 0))
     session.commit()
     after_events = session.query(RatingEvent).filter_by(match_plan_id=plan.id).count()
     assert after_events > 0

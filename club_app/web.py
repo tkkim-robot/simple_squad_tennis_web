@@ -29,14 +29,20 @@ from .models import (
     RoleAssignment,
     User,
 )
-from .services.appointments import create_missing_vote_rows, recompute_appointments, run_maintenance
+from .services.appointments import (
+    create_missing_vote_rows,
+    get_appointment_participation,
+    is_voting_open_for_appointment,
+    recompute_appointments,
+    run_maintenance,
+)
 from .services.matchmaking import (
     finalize_due_match_results,
-    get_or_create_match_plan,
     is_result_window_open,
     result_window_bounds,
     save_user_result_inputs,
     submit_results,
+    sync_match_plan_for_appointment,
 )
 from .services.notifications import queue_notification
 from .services.settings_store import all_settings_dict, app_now, set_setting
@@ -168,6 +174,93 @@ def _snapshot_ball_assignments(now_dt: datetime) -> dict[int, tuple[int, ...]]:
     return result
 
 
+def _appointment_state_snapshot(appointment_id: int) -> dict | None:
+    appointment = db.session.get(Appointment, appointment_id)
+    if appointment is None:
+        return None
+
+    participation = get_appointment_participation(appointment)
+    return {
+        "appointment_id": appointment.id,
+        "event_date": appointment.event_start.date().isoformat(),
+        "status": appointment.status,
+        "confirmed": tuple(participation.confirmed_names),
+        "waitlist": tuple(participation.waitlist_names),
+        "courts": appointment.courts_reserved,
+        "reservers": tuple(
+            sorted(
+                [ra.member.name for ra in appointment.role_assignments if ra.role_type == "RESERVER" and ra.member],
+                key=str.lower,
+            )
+        ),
+        "ball_carriers": tuple(
+            sorted(
+                [ra.member.name for ra in appointment.role_assignments if ra.role_type == "BALL_CARRIER" and ra.member],
+                key=str.lower,
+            )
+        ),
+    }
+
+
+def _queue_post_close_change_notification(actor_text: str, before: dict | None, after: dict | None) -> None:
+    if before is None or after is None or before == after:
+        return
+
+    promoted_from_waitlist = [name for name in after["confirmed"] if name in before["waitlist"]]
+    removed_from_confirmed = [name for name in before["confirmed"] if name not in after["confirmed"]]
+    moved_to_waitlist = [name for name in after["waitlist"] if name in before["confirmed"]]
+
+    body_lines = [
+        f"{actor_text} after voting had already closed for {after['event_date']}.",
+        "",
+    ]
+    if removed_from_confirmed:
+        body_lines.append(f"Removed from confirmed: {', '.join(removed_from_confirmed)}")
+    if promoted_from_waitlist:
+        body_lines.append(f"Promoted from waitlist: {', '.join(promoted_from_waitlist)}")
+    if moved_to_waitlist:
+        body_lines.append(f"Moved to waitlist: {', '.join(moved_to_waitlist)}")
+    if before["courts"] != after["courts"]:
+        body_lines.append(f"Courts changed: {before['courts']} -> {after['courts']}")
+    if before["ball_carriers"] != after["ball_carriers"]:
+        body_lines.append(
+            "Ball carriers changed: "
+            f"{', '.join(before['ball_carriers']) if before['ball_carriers'] else 'TBD'} -> "
+            f"{', '.join(after['ball_carriers']) if after['ball_carriers'] else 'TBD'}"
+        )
+    if before["reservers"] != after["reservers"]:
+        body_lines.append(
+            "Reservers changed: "
+            f"{', '.join(before['reservers']) if before['reservers'] else 'TBD'} -> "
+            f"{', '.join(after['reservers']) if after['reservers'] else 'TBD'}"
+        )
+
+    body_lines.extend(
+        [
+            "",
+            f"Confirmed now ({len(after['confirmed'])}): {', '.join(after['confirmed']) if after['confirmed'] else 'None'}",
+            f"Waitlist now ({len(after['waitlist'])}): {', '.join(after['waitlist']) if after['waitlist'] else 'None'}",
+            f"Courts now: {after['courts']}",
+            f"Reservers now: {', '.join(after['reservers']) if after['reservers'] else 'TBD'}",
+            f"Ball carriers now: {', '.join(after['ball_carriers']) if after['ball_carriers'] else 'TBD'}",
+        ]
+    )
+
+    queue_notification(
+        db.session,
+        f"Late Participation Update ({after['event_date']})",
+        "\n".join(body_lines),
+    )
+
+
+def _summarize_changed_names(names: list[str], limit: int = 4) -> str:
+    if not names:
+        return "no member changes"
+    if len(names) <= limit:
+        return ", ".join(names)
+    return f"{', '.join(names[:limit])}, +{len(names) - limit} more"
+
+
 @bp.route("/")
 @_login_required
 def index():
@@ -179,7 +272,14 @@ def index():
         create_missing_vote_rows(db.session, appt)
     db.session.commit()
 
-    open_appointment = next((a for a in appointments if a.status == "OPEN"), None)
+    participation_by_appointment = {appt.id: get_appointment_participation(appt) for appt in appointments}
+    voting_open_ids = {
+        appt.id
+        for appt in appointments
+        if is_voting_open_for_appointment(appt, now)
+    }
+
+    open_appointment = next((a for a in appointments if a.id in voting_open_ids), None)
     upcoming_appointment = next((a for a in appointments if a.event_start >= now), None)
     upcoming_appointment_id = upcoming_appointment.id if upcoming_appointment else None
 
@@ -246,6 +346,8 @@ def index():
         user=g.user,
         members=members,
         appointments=appointments,
+        participation_by_appointment=participation_by_appointment,
+        voting_open_ids=voting_open_ids,
         open_appointment=open_appointment,
         upcoming_appointment=upcoming_appointment,
         upcoming_appointment_id=upcoming_appointment_id,
@@ -345,17 +447,22 @@ def vote_appointment(appointment_id: int):
     if appointment.event_start <= now:
         flash("This appointment has already started.", "error")
         return redirect(url_for("web.index", tab="appointments"))
-    if appointment.status != "OPEN" or not (appointment.vote_open_at <= now < appointment.vote_close_at):
-        flash("Voting is currently closed for this appointment.", "error")
-        return redirect(url_for("web.index", tab="appointments"))
-
-    will_join = request.form.get("will_join") == "1"
 
     vote = (
         db.session.query(AppointmentVote)
         .filter_by(appointment_id=appointment.id, member_id=g.user.member.id)
         .one_or_none()
     )
+    current_joining = vote.will_join if vote is not None else False
+
+    will_join = request.form.get("will_join") == "1"
+    voting_open = is_voting_open_for_appointment(appointment, now)
+    can_cancel_after_close = (not will_join) and current_joining
+    if not voting_open and not can_cancel_after_close:
+        flash("Voting is currently closed for this appointment.", "error")
+        return redirect(url_for("web.index", tab="appointments"))
+
+    before = _appointment_state_snapshot(appointment.id) if appointment.vote_close_at <= now else None
     if vote is None:
         vote = AppointmentVote(
             appointment_id=appointment.id,
@@ -365,28 +472,83 @@ def vote_appointment(appointment_id: int):
         db.session.add(vote)
     else:
         vote.will_join = will_join
+    vote.updated_at = now
 
     was_ball_carrier = any(
         ra.role_type == "BALL_CARRIER" and ra.member_id == g.user.member.id
         for ra in appointment.role_assignments
     )
 
-    before = _snapshot_ball_assignments(now)
+    ball_before = _snapshot_ball_assignments(now)
     run_maintenance(db.session)
-    after = _snapshot_ball_assignments(now)
+    ball_after = _snapshot_ball_assignments(now)
+    after = _appointment_state_snapshot(appointment.id) if appointment.vote_close_at <= now else None
 
-    if was_ball_carrier and not will_join and before != after:
+    if appointment.vote_close_at <= now:
+        action_text = "updated their participation"
+        if not will_join:
+            action_text = "canceled participation"
+        _queue_post_close_change_notification(f"{g.user.member.name} {action_text}", before, after)
+
+    if was_ball_carrier and not will_join and ball_before != ball_after:
         queue_notification(
             db.session,
             f"Ball Carrier Change Needed ({appointment.event_start.date().isoformat()})",
             (
                 f"{g.user.member.name} canceled participation after ball-carrier assignment. "
-                "The system recalculated assignments; admin should review replacements."
+                "The system recalculated assignments and the current ball-carrier list should be reviewed."
             ),
         )
 
     db.session.commit()
     flash("Your appointment vote was updated.", "ok")
+    return redirect(url_for("web.index", tab="appointments"))
+
+
+@bp.route("/appointments/<int:appointment_id>/admin-votes", methods=["POST"])
+@_admin_required
+def admin_update_votes(appointment_id: int):
+    appointment = db.session.get(Appointment, appointment_id)
+    if appointment is None:
+        flash("Appointment not found.", "error")
+        return redirect(url_for("web.index", tab="appointments"))
+
+    now = app_now(db.session)
+    if appointment.event_start <= now:
+        flash("This appointment has already started.", "error")
+        return redirect(url_for("web.index", tab="appointments"))
+
+    create_missing_vote_rows(db.session, appointment)
+    db.session.flush()
+
+    before = _appointment_state_snapshot(appointment.id) if appointment.vote_close_at <= now else None
+    changed_names: list[str] = []
+
+    for vote in sorted(appointment.votes, key=lambda item: ((item.member.name if item.member else "").lower(), item.member_id)):
+        if vote.member is None or not vote.member.active:
+            continue
+        raw_value = request.form.get(f"vote_{vote.member_id}")
+        if raw_value not in {"0", "1"}:
+            continue
+        will_join = raw_value == "1"
+        if vote.will_join == will_join:
+            continue
+        vote.will_join = will_join
+        vote.updated_at = now
+        changed_names.append(vote.member.name)
+
+    run_maintenance(db.session)
+    after = _appointment_state_snapshot(appointment.id) if appointment.vote_close_at <= now else None
+
+    if appointment.vote_close_at <= now and changed_names:
+        summary = _summarize_changed_names(changed_names)
+        _queue_post_close_change_notification(f"Admin confirmed vote edits for {summary}", before, after)
+
+    db.session.commit()
+    if changed_names:
+        flash(f"Vote edits saved for {len(changed_names)} member(s).", "ok")
+    else:
+        flash("No vote changes detected. Maintenance still recomputed the appointment.", "ok")
     return redirect(url_for("web.index", tab="appointments"))
 
 
@@ -415,9 +577,14 @@ def add_guest(appointment_id: int):
         closest_member_id=closest.id,
         active=True,
     )
+    before = _appointment_state_snapshot(appointment.id) if appointment.vote_close_at <= app_now(db.session) else None
     db.session.add(guest)
+    db.session.flush()
 
     run_maintenance(db.session)
+    after = _appointment_state_snapshot(appointment.id) if appointment.vote_close_at <= app_now(db.session) else None
+    if appointment.vote_close_at <= app_now(db.session):
+        _queue_post_close_change_notification(f"Admin added guest {name}", before, after)
     db.session.commit()
 
     flash(f"Guest {name} added for appointment.", "ok")
@@ -432,8 +599,14 @@ def toggle_guest(appointment_id: int, guest_id: int):
         flash("Guest record not found.", "error")
         return redirect(url_for("web.index", tab="appointments"))
 
+    now = app_now(db.session)
+    before = _appointment_state_snapshot(appointment_id) if guest.appointment.vote_close_at <= now else None
     guest.active = not guest.active
     run_maintenance(db.session)
+    after = _appointment_state_snapshot(appointment_id) if guest.appointment.vote_close_at <= now else None
+    if guest.appointment.vote_close_at <= now:
+        action = "enabled" if guest.active else "disabled"
+        _queue_post_close_change_notification(f"Admin {action} guest {guest.name}", before, after)
     db.session.commit()
 
     flash(f"Guest {guest.name} {'enabled' if guest.active else 'disabled'}.", "ok")
@@ -531,7 +704,9 @@ def generate_matchmaking_plan():
         return redirect(url_for("web.index", tab="matchmaking"))
 
     try:
-        plan = get_or_create_match_plan(db.session, appointment_id, g.user.id, rounds=3)
+        plan = sync_match_plan_for_appointment(db.session, appointment_id, g.user.id, rounds=3)
+        if plan is None:
+            raise ValueError("Need at least 4 confirmed players to create doubles matches")
         db.session.commit()
         flash(f"Match plan ready: #{plan.id}.", "ok")
     except Exception as exc:
@@ -551,7 +726,8 @@ def input_match_results(plan_id: int):
 
     now = app_now(db.session)
     if not is_result_window_open(plan.appointment, now):
-        flash("Result input window is closed (Tue 8pm to Wed 9am).", "error")
+        _, close_at = result_window_bounds(plan.appointment.event_start)
+        flash(f"Result input window is closed. It stays open until {close_at}.", "error")
         return redirect(url_for("web.index", tab="matchmaking"))
 
     already_applied = (
@@ -588,7 +764,7 @@ def input_match_results(plan_id: int):
     try:
         save_user_result_inputs(db.session, plan.id, g.user.id, scores)
         db.session.commit()
-        flash("Results saved. Ranking updates will apply after Wed 9am.", "ok")
+        flash("Results saved. Ranking updates will apply after the result window closes.", "ok")
     except Exception as exc:
         db.session.rollback()
         flash(str(exc), "error")
@@ -607,7 +783,7 @@ def submit_match_results(plan_id: int):
     now = app_now(db.session)
     _, close_at = result_window_bounds(plan.appointment.event_start)
     if now < close_at:
-        flash("Ranking cannot be applied before Wed 9am. Use result input instead.", "error")
+        flash(f"Ranking cannot be applied before the result window closes at {close_at}.", "error")
         return redirect(url_for("web.index", tab="matchmaking"))
 
     already_applied = (

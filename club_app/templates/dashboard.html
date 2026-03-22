@@ -38,11 +38,16 @@
 
   <main class="page-wrap">
     {% if open_appointment %}
-    {% set live_joined = open_appointment.votes | selectattr('will_join') | map(attribute='member.name') | list %}
+    {% set live_participation = participation_by_appointment.get(open_appointment.id) %}
     <section class="card vote-focus">
       <h2>Live Vote Window</h2>
       <p><strong>{{ open_appointment.title }}</strong> | {{ open_appointment.event_start }} - {{ open_appointment.event_end }}</p>
-      <p>Vote closes at <strong>{{ open_appointment.vote_close_at }}</strong>. Current joined count: <strong>{{ live_joined|length + (open_appointment.guests | selectattr('active') | list | length) }}</strong></p>
+      <p>
+        Vote closes at <strong>{{ open_appointment.vote_close_at }}</strong>.
+        Raw yes votes: <strong>{{ live_participation.raw_count }}</strong> |
+        Confirmed: <strong>{{ live_participation.confirmed_count }}</strong> |
+        Waitlist: <strong>{{ live_participation.waitlist_count }}</strong>
+      </p>
       {% if user.member %}
       <div class="inline-group">
         <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=open_appointment.id) }}" class="inline-form">
@@ -55,7 +60,8 @@
         </form>
       </div>
       {% endif %}
-      <p class="muted">Live voters: {{ live_joined | join(', ') if live_joined else 'No votes yet' }}</p>
+      <p class="muted">Confirmed now: {{ live_participation.confirmed_names | join(', ') if live_participation.confirmed_names else 'No confirmed players yet' }}</p>
+      <p class="muted">Waitlist: {{ live_participation.waitlist_names | join(', ') if live_participation.waitlist_names else 'None' }}</p>
     </section>
     {% endif %}
 
@@ -63,7 +69,7 @@
     <section class="card results-focus">
       <h2>Tuesday Night Match Results</h2>
       <p><strong>Plan #{{ active_result_plan.id }}</strong> for {{ active_result_plan.appointment.event_start.date() }} | Window: {{ active_result_open_at }} to {{ active_result_close_at }}</p>
-      <p class="muted">Each user can enter/edit results independently. Ranking updates are applied automatically after Wednesday 9:00 AM.</p>
+      <p class="muted">Each user can enter or edit results during this full window. Ranking updates are applied automatically after the window closes.</p>
 
       <form method="post" action="{{ url_for('web.input_match_results', plan_id=active_result_plan.id) }}" class="stack-form">
         {% for game in active_result_plan.games %}
@@ -162,7 +168,8 @@
 
     <section class="tab-panel" id="tab-appointments">
       {% if upcoming_appointment %}
-      {% set up_joined_members = upcoming_appointment.votes | selectattr('will_join') | map(attribute='member.name') | list %}
+      {% set up_participation = participation_by_appointment.get(upcoming_appointment.id) %}
+      {% set up_user_vote = upcoming_appointment.votes | selectattr('member_id', 'equalto', user.member.id if user.member else -1) | list | first %}
       {% set up_ball_roles = upcoming_appointment.role_assignments | selectattr('role_type', 'equalto', 'BALL_CARRIER') | map(attribute='member.name') | list %}
       {% set up_reserve_roles = upcoming_appointment.role_assignments | selectattr('role_type', 'equalto', 'RESERVER') | map(attribute='member.name') | list %}
       <article class="card appointment-card upcoming-card">
@@ -172,18 +179,58 @@
         </header>
         <p><strong>Event:</strong> {{ upcoming_appointment.event_start }} - {{ upcoming_appointment.event_end }}</p>
         <p><strong>Vote Window:</strong> {{ upcoming_appointment.vote_open_at }} to {{ upcoming_appointment.vote_close_at }}</p>
-        <p><strong>Joined:</strong> {{ upcoming_appointment.joined_count }} | <strong>Courts:</strong> {{ upcoming_appointment.courts_reserved }}</p>
+        <p><strong>Confirmed:</strong> {{ upcoming_appointment.joined_count }} of {{ up_participation.raw_count }} | <strong>Waitlist:</strong> {{ up_participation.waitlist_count }} | <strong>Courts:</strong> {{ upcoming_appointment.courts_reserved }}</p>
         <p><strong>Ball Carriers:</strong> {{ up_ball_roles | join(', ') if up_ball_roles else 'TBD' }}</p>
         <p><strong>Reservers:</strong> {{ up_reserve_roles | join(', ') if up_reserve_roles else 'TBD' }}</p>
-        {% if user.member and upcoming_appointment.status == 'OPEN' %}
+        <p><strong>Confirmed Players:</strong> {{ up_participation.confirmed_names | join(', ') if up_participation.confirmed_names else 'None' }}</p>
+        <p><strong>Waitlist:</strong> {{ up_participation.waitlist_names | join(', ') if up_participation.waitlist_names else 'None' }}</p>
+        <details>
+          <summary>Details</summary>
+          <div class="votes-grid">
+            {% for vote in upcoming_appointment.votes | sort(attribute='member.name') %}
+            <div class="vote-pill {{ 'join' if vote.will_join else 'skip' }}">{{ vote.member.name }}: {{ 'Join' if vote.will_join else 'No' }}</div>
+            {% endfor %}
+          </div>
+
+          {% if user.is_admin %}
+          <form method="post" action="{{ url_for('web.admin_update_votes', appointment_id=upcoming_appointment.id) }}" class="stack-form compact card-subsection">
+            <h4>Edit Votes</h4>
+            <p class="muted">Change vote status here, then click Confirm Votes to recompute confirmed players, waitlist, courts, ball carriers, reservers, and notifications.</p>
+            <div class="vote-editor-grid">
+              {% for vote in upcoming_appointment.votes | sort(attribute='member.name') %}
+              <label class="vote-editor-row">
+                <span class="vote-editor-name">{{ vote.member.name }}</span>
+                <select name="vote_{{ vote.member_id }}">
+                  <option value="1" {% if vote.will_join %}selected{% endif %}>Join</option>
+                  <option value="0" {% if not vote.will_join %}selected{% endif %}>No</option>
+                </select>
+                <span class="vote-editor-note">
+                  {% if vote.member.name in up_participation.confirmed_names %}
+                  Confirmed
+                  {% elif vote.member.name in up_participation.waitlist_names %}
+                  Waitlist
+                  {% else %}
+                  Not joining
+                  {% endif %}
+                </span>
+              </label>
+              {% endfor %}
+            </div>
+            <button type="submit">Confirm Votes</button>
+          </form>
+          {% endif %}
+        </details>
+        {% if user.member and (upcoming_appointment.id in voting_open_ids or (up_user_vote and up_user_vote.will_join and upcoming_appointment.event_start > now)) %}
         <div class="inline-group">
+          {% if upcoming_appointment.id in voting_open_ids %}
           <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=upcoming_appointment.id) }}" class="inline-form">
             <input type="hidden" name="will_join" value="1" />
             <button type="submit">I will join</button>
           </form>
+          {% endif %}
           <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=upcoming_appointment.id) }}" class="inline-form">
             <input type="hidden" name="will_join" value="0" />
-            <button type="submit" class="secondary">I cannot join</button>
+            <button type="submit" class="secondary">{{ 'Cancel My Spot' if up_user_vote and up_user_vote.will_join and upcoming_appointment.id not in voting_open_ids else 'I cannot join' }}</button>
           </form>
         </div>
         {% endif %}
@@ -209,29 +256,59 @@
       <div id="appointments-list" class="cards-grid">
         {% for appt in appointments %}
         {% if appt.id != upcoming_appointment_id %}
-        {% set joined_members = appt.votes | selectattr('will_join') | map(attribute='member.name') | list %}
+        {% set participation = participation_by_appointment.get(appt.id) %}
+        {% set appt_user_vote = appt.votes | selectattr('member_id', 'equalto', user.member.id if user.member else -1) | list | first %}
         {% set ball_roles = appt.role_assignments | selectattr('role_type', 'equalto', 'BALL_CARRIER') | map(attribute='member.name') | list %}
         {% set reserve_roles = appt.role_assignments | selectattr('role_type', 'equalto', 'RESERVER') | map(attribute='member.name') | list %}
-        <article class="card appointment-card" data-status="{{ appt.status }}" data-search="{{ appt.title }} {{ appt.status }} {{ appt.event_start.date() }} {{ joined_members | join(' ') }}">
+        <article class="card appointment-card" data-status="{{ appt.status }}" data-search="{{ appt.title }} {{ appt.status }} {{ appt.event_start.date() }} {{ participation.confirmed_names | join(' ') }} {{ participation.waitlist_names | join(' ') }}">
           <header>
             <h3>{{ appt.title }}</h3>
             <span class="status status-{{ appt.status|lower }}">{{ appt.status }}</span>
           </header>
           <p><strong>Event:</strong> {{ appt.event_start }} - {{ appt.event_end }}</p>
           <p><strong>Vote closes:</strong> {{ appt.vote_close_at }}</p>
-          <p><strong>Joined:</strong> {{ appt.joined_count }} | <strong>Courts:</strong> {{ appt.courts_reserved }}</p>
+          <p><strong>Confirmed:</strong> {{ appt.joined_count }} of {{ participation.raw_count }} | <strong>Waitlist:</strong> {{ participation.waitlist_count }} | <strong>Courts:</strong> {{ appt.courts_reserved }}</p>
           <p><strong>Ball Carriers:</strong> {{ ball_roles | join(', ') if ball_roles else 'TBD' }}</p>
           <p><strong>Reservers:</strong> {{ reserve_roles | join(', ') if reserve_roles else 'TBD' }}</p>
 
           <details>
             <summary>Details</summary>
-            <p><strong>Joined Members:</strong> {{ joined_members | join(', ') if joined_members else 'None' }}</p>
+            <p><strong>Confirmed Players:</strong> {{ participation.confirmed_names | join(', ') if participation.confirmed_names else 'None' }}</p>
+            <p><strong>Waitlist:</strong> {{ participation.waitlist_names | join(', ') if participation.waitlist_names else 'None' }}</p>
 
             <div class="votes-grid">
               {% for vote in appt.votes | sort(attribute='member.name') %}
               <div class="vote-pill {{ 'join' if vote.will_join else 'skip' }}">{{ vote.member.name }}: {{ 'Join' if vote.will_join else 'No' }}</div>
               {% endfor %}
             </div>
+
+            {% if user.is_admin %}
+            <form method="post" action="{{ url_for('web.admin_update_votes', appointment_id=appt.id) }}" class="stack-form compact card-subsection">
+              <h4>Edit Votes</h4>
+              <p class="muted">Change vote status here, then click Confirm Votes to recompute confirmed players, waitlist, courts, ball carriers, reservers, and notifications.</p>
+              <div class="vote-editor-grid">
+                {% for vote in appt.votes | sort(attribute='member.name') %}
+                <label class="vote-editor-row">
+                  <span class="vote-editor-name">{{ vote.member.name }}</span>
+                  <select name="vote_{{ vote.member_id }}">
+                    <option value="1" {% if vote.will_join %}selected{% endif %}>Join</option>
+                    <option value="0" {% if not vote.will_join %}selected{% endif %}>No</option>
+                  </select>
+                  <span class="vote-editor-note">
+                    {% if vote.member.name in participation.confirmed_names %}
+                    Confirmed
+                    {% elif vote.member.name in participation.waitlist_names %}
+                    Waitlist
+                    {% else %}
+                    Not joining
+                    {% endif %}
+                  </span>
+                </label>
+                {% endfor %}
+              </div>
+              <button type="submit">Confirm Votes</button>
+            </form>
+            {% endif %}
 
             {% if appt.guests %}
             <h4>Guests</h4>
@@ -265,15 +342,17 @@
             {% endif %}
           </details>
 
-          {% if user.member and appt.status == 'OPEN' %}
+          {% if user.member and (appt.id in voting_open_ids or (appt_user_vote and appt_user_vote.will_join and appt.event_start > now)) %}
           <div class="inline-group">
+            {% if appt.id in voting_open_ids %}
             <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=appt.id) }}" class="inline-form">
               <input type="hidden" name="will_join" value="1" />
               <button type="submit">I will join</button>
             </form>
+            {% endif %}
             <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=appt.id) }}" class="inline-form">
               <input type="hidden" name="will_join" value="0" />
-              <button type="submit" class="secondary">I cannot join</button>
+              <button type="submit" class="secondary">{{ 'Cancel My Spot' if appt_user_vote and appt_user_vote.will_join and appt.id not in voting_open_ids else 'I cannot join' }}</button>
             </form>
           </div>
           {% endif %}
@@ -289,8 +368,9 @@
 
       {% if active_result_plan %}
       <article class="card">
-        <h3>Result Input Window (Tue 8pm - Wed 9am)</h3>
+        <h3>Result Input Window</h3>
         <p>Plan #{{ active_result_plan.id }} for {{ active_result_plan.appointment.event_start.date() }} is currently open for independent result entry.</p>
+        <p class="muted">Window: {{ active_result_open_at }} to {{ active_result_close_at }}</p>
         <form method="post" action="{{ url_for('web.input_match_results', plan_id=active_result_plan.id) }}" class="stack-form">
           {% for game in active_result_plan.games %}
           {% set prev_score = active_result_user_inputs.get(game.id) %}

@@ -8,6 +8,7 @@ from sqlalchemy import and_
 
 from ..models import (
     Appointment,
+    AppointmentGuest,
     AppointmentVote,
     MatchPlan,
     MatchPlanGame,
@@ -18,13 +19,49 @@ from ..models import (
     User,
 )
 from .notifications import dispatch_pending_notifications, queue_notification
-from .settings_store import app_now, get_setting_int, get_setting_json
+from .settings_store import app_now, get_setting_int
 
 
 @dataclass
 class RoleSelection:
     members: list[Member]
     slots: int
+
+
+@dataclass(frozen=True)
+class ParticipationCandidate:
+    ordered_at: datetime
+    member: Member | None = None
+    guest: AppointmentGuest | None = None
+
+    @property
+    def display_name(self) -> str:
+        if self.member is not None:
+            return self.member.name
+        if self.guest is not None:
+            return f"Guest {self.guest.name}"
+        return "Unknown"
+
+
+@dataclass
+class AppointmentParticipation:
+    confirmed_members: list[Member]
+    waitlisted_members: list[Member]
+    confirmed_guests: list[AppointmentGuest]
+    waitlisted_guests: list[AppointmentGuest]
+    confirmed_names: list[str]
+    waitlist_names: list[str]
+    raw_count: int
+    confirmed_count: int
+    courts_to_reserve: int
+
+    @property
+    def waitlist_count(self) -> int:
+        return len(self.waitlisted_members) + len(self.waitlisted_guests)
+
+    @property
+    def is_three_player_exception(self) -> bool:
+        return self.raw_count == 3 and self.confirmed_count == 3 and self.courts_to_reserve == 1
 
 
 def _nth_weekday_after(start_date: date, target_weekday: int, n: int) -> date:
@@ -51,19 +88,21 @@ def _start_of_week(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
-def compute_courts_for_count(session, total_players: int) -> int:
-    min_players = get_setting_int(session, "min_players_to_run", 3)
-    if total_players < min_players:
+def _playable_player_count(total_players: int) -> int:
+    if total_players < 3:
         return 0
+    if total_players == 3:
+        return 3
+    return total_players - (total_players % 4)
 
-    rules = get_setting_json(session, "court_rules_json", []) or []
-    for rule in rules:
-        r_min = int(rule.get("min", 0))
-        r_max = int(rule.get("max", 999))
-        courts = int(rule.get("courts", 0))
-        if r_min <= total_players <= r_max:
-            return max(0, courts)
-    return 0
+
+def compute_courts_for_count(session, total_players: int) -> int:
+    playable_players = _playable_player_count(total_players)
+    if playable_players <= 0:
+        return 0
+    if playable_players == 3:
+        return 1
+    return max(1, playable_players // 4)
 
 
 def ensure_auto_appointments(session, now: datetime) -> list[Appointment]:
@@ -121,16 +160,75 @@ def ensure_auto_appointments(session, now: datetime) -> list[Appointment]:
     return created
 
 
-def _confirmed_member_list(appointment: Appointment) -> list[Member]:
-    seen: dict[int, Member] = {}
+def _participation_candidates(appointment: Appointment) -> list[ParticipationCandidate]:
+    candidates: list[ParticipationCandidate] = []
+    default_member_time = appointment.vote_open_at or appointment.created_at or datetime(1970, 1, 1)
+    default_guest_time = appointment.vote_close_at or appointment.vote_open_at or appointment.created_at or datetime(1970, 1, 1)
+
+    seen_member_ids: set[int] = set()
     for vote in appointment.votes:
-        if vote.will_join and vote.member and vote.member.active:
-            seen[vote.member.id] = vote.member
-    return list(seen.values())
+        if not vote.will_join or vote.member is None or not vote.member.active:
+            continue
+        if vote.member.id in seen_member_ids:
+            continue
+        seen_member_ids.add(vote.member.id)
+        candidates.append(
+            ParticipationCandidate(
+                ordered_at=vote.updated_at or default_member_time,
+                member=vote.member,
+            )
+        )
+
+    seen_guest_ids: set[int] = set()
+    for guest in appointment.guests:
+        if not guest.active or guest.id in seen_guest_ids:
+            continue
+        seen_guest_ids.add(guest.id)
+        candidates.append(
+            ParticipationCandidate(
+                ordered_at=guest.created_at or default_guest_time,
+                guest=guest,
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            item.ordered_at,
+            0 if item.member is not None else 1,
+            item.member.id if item.member is not None else item.guest.id if item.guest is not None else 0,
+        )
+    )
+    return candidates
 
 
-def _active_guest_count(appointment: Appointment) -> int:
-    return len([g for g in appointment.guests if g.active])
+def get_appointment_participation(appointment: Appointment) -> AppointmentParticipation:
+    candidates = _participation_candidates(appointment)
+    confirmed_target = _playable_player_count(len(candidates))
+    confirmed_candidates = candidates[:confirmed_target]
+    waitlisted_candidates = candidates[confirmed_target:]
+
+    return AppointmentParticipation(
+        confirmed_members=[item.member for item in confirmed_candidates if item.member is not None],
+        waitlisted_members=[item.member for item in waitlisted_candidates if item.member is not None],
+        confirmed_guests=[item.guest for item in confirmed_candidates if item.guest is not None],
+        waitlisted_guests=[item.guest for item in waitlisted_candidates if item.guest is not None],
+        confirmed_names=[item.display_name for item in confirmed_candidates],
+        waitlist_names=[item.display_name for item in waitlisted_candidates],
+        raw_count=len(candidates),
+        confirmed_count=confirmed_target,
+        courts_to_reserve=compute_courts_for_count(None, len(candidates)),
+    )
+
+
+def is_voting_open_for_appointment(appointment: Appointment, now: datetime) -> bool:
+    if appointment.event_start <= now:
+        return False
+    if appointment.vote_open_at <= now < appointment.vote_close_at:
+        return True
+    if not (appointment.vote_close_at <= now < appointment.event_start):
+        return False
+    participation = get_appointment_participation(appointment)
+    return participation.raw_count == 3
 
 
 def _select_for_role(
@@ -214,18 +312,19 @@ def recompute_appointments(session, now: datetime | None = None) -> None:
     reserver_slots_per_court = max(1, get_setting_int(session, "reservers_per_court", 1))
 
     for appt in appointments:
+        participation = get_appointment_participation(appt)
         if now < appt.vote_open_at:
             appt.status = "PLANNED"
             appt.finalized_at = None
-            appt.joined_count = len(_confirmed_member_list(appt)) + _active_guest_count(appt)
-            appt.courts_reserved = compute_courts_for_count(session, appt.joined_count)
+            appt.joined_count = participation.confirmed_count
+            appt.courts_reserved = participation.courts_to_reserve
             continue
 
         if appt.vote_open_at <= now < appt.vote_close_at:
             appt.status = "OPEN"
             appt.finalized_at = None
-            appt.joined_count = len(_confirmed_member_list(appt)) + _active_guest_count(appt)
-            appt.courts_reserved = compute_courts_for_count(session, appt.joined_count)
+            appt.joined_count = participation.confirmed_count
+            appt.courts_reserved = participation.courts_to_reserve
             continue
 
         previous = appointment_by_event_date.get(appt.event_start.date() - timedelta(days=7))
@@ -237,9 +336,9 @@ def recompute_appointments(session, now: datetime | None = None) -> None:
                 > 0
             )
             if not has_ball:
-                prev_members = _confirmed_member_list(previous)
-                prev_total = len(prev_members) + _active_guest_count(previous)
-                prev_courts = compute_courts_for_count(session, prev_total)
+                prev_participation = get_appointment_participation(previous)
+                prev_members = prev_participation.confirmed_members
+                prev_courts = prev_participation.courts_to_reserve
                 slots = prev_courts * ball_slots_per_court
                 selection = _select_for_role(prev_members, slots, "BALL_CARRIER")
                 for idx, member in enumerate(selection.members):
@@ -253,10 +352,9 @@ def recompute_appointments(session, now: datetime | None = None) -> None:
                     member.ball_wait_count = 0
                     member.last_ball_assigned_at = appt.vote_close_at
 
-        joined_members = _confirmed_member_list(appt)
-        total_joined = len(joined_members) + _active_guest_count(appt)
-        appt.joined_count = total_joined
-        courts = compute_courts_for_count(session, total_joined)
+        joined_members = participation.confirmed_members
+        appt.joined_count = participation.confirmed_count
+        courts = participation.courts_to_reserve
         appt.courts_reserved = courts
 
         if courts <= 0:
@@ -276,7 +374,10 @@ def recompute_appointments(session, now: datetime | None = None) -> None:
             member.reserver_wait_count = 0
             member.last_reserver_assigned_at = appt.vote_close_at
 
-        appt.status = "COMPLETED" if appt.event_end <= now else "CLOSED"
+        if appt.vote_close_at <= now < appt.event_start and participation.is_three_player_exception:
+            appt.status = "EXTENDED"
+        else:
+            appt.status = "COMPLETED" if appt.event_end <= now else "CLOSED"
         appt.finalized_at = appt.vote_close_at
 
     # Safety rail: keep at most one OPEN appointment even if data is malformed.
@@ -336,9 +437,9 @@ def build_appointment_notification(
     coming_plan: MatchPlan | None = None,
     match_plan_error: str | None = None,
 ) -> tuple[str, str]:
-    joined_members = _confirmed_member_list(appointment)
-    guest_names = [g.name for g in appointment.guests if g.active]
-    joined_names = sorted([m.name for m in joined_members]) + sorted(guest_names)
+    participation = get_appointment_participation(appointment)
+    joined_names = participation.confirmed_names
+    waitlist_names = participation.waitlist_names
     reserver_names = _list_role_names(appointment, "RESERVER")
 
     previous = coming_appointment
@@ -362,7 +463,8 @@ def build_appointment_notification(
     title = f"Vote Closed Summary {appointment.event_start.date().isoformat()}"
     coming_date_text = previous.event_start.date().isoformat() if previous else "N/A"
     body_lines = [
-        f"Who ({len(joined_names)}): {', '.join(joined_names) if joined_names else 'None'}",
+        f"Confirmed ({participation.confirmed_count} of {participation.raw_count}): {', '.join(joined_names) if joined_names else 'None'}",
+        f"Waitlist ({participation.waitlist_count}): {', '.join(waitlist_names) if waitlist_names else 'None'}",
         "",
         f"How many courts to reserve: {appointment.courts_reserved}",
         "",
@@ -371,6 +473,13 @@ def build_appointment_notification(
         "",
         f"Coming Tuesday Match Making ({coming_date_text}):",
     ]
+    if participation.is_three_player_exception and appointment.event_start > appointment.vote_close_at:
+        body_lines.extend(
+            [
+                "",
+                f"Voting stays open until {appointment.event_start} because this week only has 3 players so far.",
+            ]
+        )
     body_lines.extend(_match_plan_summary(session, coming_plan))
     if match_plan_error:
         body_lines.extend(["", f"Match making generation error: {match_plan_error}"])
@@ -403,6 +512,22 @@ def run_maintenance(session) -> None:
     recompute_appointments(session, now)
     session.flush()
 
+    admin = (
+        session.query(User)
+        .filter(User.is_admin.is_(True))
+        .order_by(User.id.asc())
+        .first()
+    )
+
+    if admin is not None:
+        from .matchmaking import sync_match_plan_for_appointment
+
+        for appt in appointments:
+            if appt.vote_close_at > now:
+                continue
+            sync_match_plan_for_appointment(session, appt.id, admin.id, rounds=3)
+        session.flush()
+
     ready_to_notify = (
         session.query(Appointment)
         .filter(
@@ -424,19 +549,13 @@ def run_maintenance(session) -> None:
         )
         match_plan_error = None
         if current_plan is None and appt.courts_reserved > 0 and appt.joined_count >= 4:
-            admin = (
-                session.query(User)
-                .filter(User.is_admin.is_(True))
-                .order_by(User.id.asc())
-                .first()
-            )
             if admin is None:
                 match_plan_error = "No admin account available to own generated plan."
             else:
                 try:
-                    from .matchmaking import get_or_create_match_plan
+                    from .matchmaking import sync_match_plan_for_appointment
 
-                    current_plan = get_or_create_match_plan(session, appt.id, admin.id, rounds=3)
+                    current_plan = sync_match_plan_for_appointment(session, appt.id, admin.id, rounds=3)
                     session.flush()
                 except Exception as exc:
                     match_plan_error = str(exc)
@@ -455,17 +574,11 @@ def run_maintenance(session) -> None:
                 .first()
             )
             if coming_plan is None and coming_appointment.courts_reserved > 0 and coming_appointment.joined_count >= 4:
-                admin = (
-                    session.query(User)
-                    .filter(User.is_admin.is_(True))
-                    .order_by(User.id.asc())
-                    .first()
-                )
                 if admin is not None:
                     try:
-                        from .matchmaking import get_or_create_match_plan
+                        from .matchmaking import sync_match_plan_for_appointment
 
-                        coming_plan = get_or_create_match_plan(session, coming_appointment.id, admin.id, rounds=3)
+                        coming_plan = sync_match_plan_for_appointment(session, coming_appointment.id, admin.id, rounds=3)
                         session.flush()
                     except Exception as exc:
                         match_plan_error = str(exc)

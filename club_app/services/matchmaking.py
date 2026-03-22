@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from itertools import combinations
 from typing import Iterable
 
@@ -17,6 +17,7 @@ from ..models import (
     PracticeAssignment,
     RatingEvent,
 )
+from .appointments import get_appointment_participation
 from .settings_store import app_now
 
 
@@ -217,14 +218,6 @@ def _select_round_matches(
     return selected
 
 
-def _confirmed_member_list(appointment: Appointment) -> list[Member]:
-    seen: dict[int, Member] = {}
-    for vote in appointment.votes:
-        if vote.will_join and vote.member and vote.member.active:
-            seen[vote.member.id] = vote.member
-    return list(seen.values())
-
-
 def generate_match_plan(
     session,
     appointment_id: int,
@@ -235,8 +228,9 @@ def generate_match_plan(
     if appointment is None:
         raise ValueError("Appointment not found")
 
-    joined_members = _confirmed_member_list(appointment)
-    guests = [g for g in appointment.guests if g.active]
+    participation = get_appointment_participation(appointment)
+    joined_members = participation.confirmed_members
+    guests = participation.confirmed_guests
 
     if len(joined_members) + len(guests) < 4:
         raise ValueError("Need at least 4 participants to create doubles matches")
@@ -396,9 +390,75 @@ def get_or_create_match_plan(
     return generate_match_plan(session, appointment_id, created_by_user_id, rounds=rounds)
 
 
+def _appointment_roster_signature(appointment: Appointment) -> tuple[tuple, ...]:
+    participation = get_appointment_participation(appointment)
+    entries: list[tuple] = []
+    for member in participation.confirmed_members:
+        entries.append(("M", member.id))
+    for guest in participation.confirmed_guests:
+        entries.append(("G", guest.name, guest.closest_member_id))
+    return tuple(sorted(entries))
+
+
+def _plan_roster_signature(plan: MatchPlan) -> tuple[tuple, ...]:
+    entries: list[tuple] = []
+    for participant in plan.participants:
+        if participant.member_id is not None:
+            entries.append(("M", participant.member_id))
+        elif participant.is_guest:
+            entries.append(("G", participant.guest_name or participant.display_name, participant.anchor_member_id))
+    return tuple(sorted(entries))
+
+
+def sync_match_plan_for_appointment(
+    session,
+    appointment_id: int,
+    created_by_user_id: int,
+    rounds: int = 3,
+) -> MatchPlan | None:
+    appointment = session.get(Appointment, appointment_id)
+    if appointment is None:
+        raise ValueError("Appointment not found")
+
+    existing_plans = (
+        session.query(MatchPlan)
+        .filter(MatchPlan.appointment_id == appointment_id)
+        .order_by(MatchPlan.created_at.desc(), MatchPlan.id.desc())
+        .all()
+    )
+    protected_plan_ids = {
+        plan.id
+        for plan in existing_plans
+        if session.query(RatingEvent).filter(RatingEvent.match_plan_id == plan.id).count() > 0
+    }
+
+    participation = get_appointment_participation(appointment)
+    if participation.confirmed_count < 4:
+        for plan in existing_plans:
+            if plan.id not in protected_plan_ids:
+                session.delete(plan)
+        return None
+
+    desired_signature = _appointment_roster_signature(appointment)
+    for plan in existing_plans:
+        if plan.id in protected_plan_ids:
+            if _plan_roster_signature(plan) == desired_signature:
+                return plan
+            continue
+        if _plan_roster_signature(plan) == desired_signature:
+            return plan
+
+    for plan in existing_plans:
+        if plan.id not in protected_plan_ids:
+            session.delete(plan)
+    session.flush()
+
+    return generate_match_plan(session, appointment_id, created_by_user_id, rounds=rounds)
+
+
 def result_window_bounds(event_start: datetime) -> tuple[datetime, datetime]:
     open_at = event_start
-    close_at = datetime.combine((event_start + timedelta(days=1)).date(), time(9, 0))
+    close_at = event_start + timedelta(days=1)
     return open_at, close_at
 
 

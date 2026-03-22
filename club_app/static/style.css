@@ -181,6 +181,11 @@ h4 {
   color: var(--blue);
 }
 
+.status-extended {
+  background: rgba(255, 203, 5, 0.24);
+  color: rgba(117, 78, 0, 0.95);
+}
+
 .status-planned {
   background: rgba(0, 39, 76, 0.08);
   color: rgba(0, 39, 76, 0.85);
@@ -368,6 +373,27 @@ button.danger {
 
 .vote-pill.skip {
   background: rgba(0, 39, 76, 0.08);
+}
+
+.vote-editor-grid {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.vote-editor-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) 110px minmax(90px, auto);
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.vote-editor-name {
+  font-weight: 700;
+}
+
+.vote-editor-note {
+  font-size: 0.82rem;
+  color: rgba(0, 39, 76, 0.72);
 }
 
 .simple-list {

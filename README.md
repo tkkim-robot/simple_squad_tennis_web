@@ -10,19 +10,19 @@ Local Flask + SQLite web app for squad management, auto-created appointments, vo
 - Squad tab (admin CRUD + member counters and ratings)
 - Appointment tab with:
   - Auto weekly appointment creation schedule (configurable)
-  - Voting and cancellation
+  - Voting, waitlist ordering, and late cancellation handling
   - Auto close/finalization and notification outbox
   - Ball carrier/reserver selection with separate counters and tie-break rules
-  - Adjustable court reservation rules
+  - Reservation logic that confirms players in `4, 8, 12, ...` groups, with a `3-player => 1 court` exception
   - Guest add/toggle and detailed appointment inspection
 - Match Making tab:
   - Uses open-source OR-Tools CP-SAT optimization
   - 3-game doubles planning
-  - Handles non-multiples-of-4 via practice groups
+  - Uses only the confirmed roster; overflow stays on the waitlist
   - Guest plays once (closest-skill anchor)
   - Pair/opponent history penalties to reduce repeats
-  - Tuesday 8pm to Wednesday 9am result-input window (independent per user)
-  - Ranking updates apply automatically after Wednesday 9am
+  - Tuesday night to Wednesday night result-input window (independent per user)
+  - Ranking updates apply automatically after the one-day result window closes
 - Leaderboard tab:
   - Rating points and history
   - Match result submission updates ratings

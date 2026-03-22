@@ -143,9 +143,9 @@ def main() -> None:
         assert admin is not None
 
         vote_plan = [
-            ["Alice", "Ben", "Chloe", "Daniel", "Evan"],  # 5 joined -> 1 court
+            ["Alice", "Ben", "Chloe", "Daniel", "Evan"],  # 5 joined -> 4 confirmed + 1 waitlist
             ["Alice", "Ben", "Fiona", "Grace", "Henry", "Ivy", "Jason", "Kathy"],  # 8 -> 2 courts
-            ["Alice", "Ben", "Chloe", "Daniel", "Evan", "Fiona", "Grace", "Henry", "Ivy", "Jason", "Leo"],  # 11 -> 3 courts
+            ["Alice", "Ben", "Chloe", "Daniel", "Evan", "Fiona", "Grace", "Henry", "Ivy", "Jason", "Leo"],  # 11 joined -> 8 confirmed + 3 waitlist
             ["Daniel", "Evan", "Fiona", "Grace"],  # 4 -> 1 court
             ["Alice", "Ben"],  # 2 -> canceled
         ]

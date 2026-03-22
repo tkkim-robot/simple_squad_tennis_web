@@ -67,11 +67,11 @@ def main() -> None:
         save_user_result_inputs(db.session, plan.id, admin.id, scores)
         db.session.commit()
 
-        finalize_due_match_results(db.session, datetime(2022, 1, 12, 8, 30, 0))
+        finalize_due_match_results(db.session, datetime(2022, 1, 12, 19, 30, 0))
         db.session.commit()
         pre_close_events = db.session.query(RatingEvent).filter(RatingEvent.match_plan_id == plan.id).count()
 
-        finalize_due_match_results(db.session, datetime(2022, 1, 12, 9, 10, 0))
+        finalize_due_match_results(db.session, datetime(2022, 1, 12, 20, 10, 0))
         db.session.commit()
         post_close_events = db.session.query(RatingEvent).filter(RatingEvent.match_plan_id == plan.id).count()
 
