@@ -261,6 +261,10 @@ def _summarize_changed_names(names: list[str], limit: int = 4) -> str:
     return f"{', '.join(names[:limit])}, +{len(names) - limit} more"
 
 
+def _is_extended_vote_window(appointment: Appointment, now: datetime) -> bool:
+    return appointment.vote_close_at <= now < appointment.event_start
+
+
 @bp.route("/")
 @_login_required
 def index():
@@ -278,8 +282,21 @@ def index():
         for appt in appointments
         if is_voting_open_for_appointment(appt, now)
     }
+    active_voting_appointments = [
+        appt
+        for appt in appointments
+        if appt.id in voting_open_ids
+    ]
+    active_voting_appointments.sort(
+        key=lambda appt: (
+            1 if _is_extended_vote_window(appt, now) else 0,
+            appt.vote_close_at,
+            appt.event_start,
+            appt.id,
+        )
+    )
 
-    open_appointment = next((a for a in appointments if a.id in voting_open_ids), None)
+    open_appointment = active_voting_appointments[0] if active_voting_appointments else None
     upcoming_appointment = next((a for a in appointments if a.event_start >= now), None)
     upcoming_appointment_id = upcoming_appointment.id if upcoming_appointment else None
 
@@ -348,6 +365,7 @@ def index():
         appointments=appointments,
         participation_by_appointment=participation_by_appointment,
         voting_open_ids=voting_open_ids,
+        active_voting_appointments=active_voting_appointments,
         open_appointment=open_appointment,
         upcoming_appointment=upcoming_appointment,
         upcoming_appointment_id=upcoming_appointment_id,

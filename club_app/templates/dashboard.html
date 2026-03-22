@@ -37,31 +37,45 @@
   {% endwith %}
 
   <main class="page-wrap">
-    {% if open_appointment %}
-    {% set live_participation = participation_by_appointment.get(open_appointment.id) %}
-    <section class="card vote-focus">
-      <h2>Live Vote Window</h2>
-      <p><strong>{{ open_appointment.title }}</strong> | {{ open_appointment.event_start }} - {{ open_appointment.event_end }}</p>
-      <p>
-        Vote closes at <strong>{{ open_appointment.vote_close_at }}</strong>.
-        Raw yes votes: <strong>{{ live_participation.raw_count }}</strong> |
-        Confirmed: <strong>{{ live_participation.confirmed_count }}</strong> |
-        Waitlist: <strong>{{ live_participation.waitlist_count }}</strong>
-      </p>
-      {% if user.member %}
-      <div class="inline-group">
-        <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=open_appointment.id) }}" class="inline-form">
-          <input type="hidden" name="will_join" value="1" />
-          <button type="submit">I will join</button>
-        </form>
-        <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=open_appointment.id) }}" class="inline-form">
-          <input type="hidden" name="will_join" value="0" />
-          <button type="submit" class="secondary">I cannot join</button>
-        </form>
-      </div>
-      {% endif %}
-      <p class="muted">Confirmed now: {{ live_participation.confirmed_names | join(', ') if live_participation.confirmed_names else 'No confirmed players yet' }}</p>
-      <p class="muted">Waitlist: {{ live_participation.waitlist_names | join(', ') if live_participation.waitlist_names else 'None' }}</p>
+    {% if active_voting_appointments %}
+    <section class="stack-form">
+      <h2>Live Vote Windows</h2>
+      {% for active_vote in active_voting_appointments %}
+      {% set live_participation = participation_by_appointment.get(active_vote.id) %}
+      {% set live_user_vote = active_vote.votes | selectattr('member_id', 'equalto', user.member.id if user.member else -1) | list | first %}
+      <article class="card vote-focus">
+        <p class="muted">
+          <strong>{{ 'Current Week Vote' if loop.first and active_vote.status != 'EXTENDED' else ('Extended Vote' if active_vote.status == 'EXTENDED' else 'Open Vote') }}</strong>
+        </p>
+        <p><strong>{{ active_vote.title }}</strong> | {{ active_vote.event_start }} - {{ active_vote.event_end }}</p>
+        <p>
+          {% if active_vote.status == 'EXTENDED' %}
+          Extended after the normal close because only 3 players joined.
+          {% else %}
+          Vote closes at <strong>{{ active_vote.vote_close_at }}</strong>.
+          {% endif %}
+          Raw yes votes: <strong>{{ live_participation.raw_count }}</strong> |
+          Confirmed: <strong>{{ live_participation.confirmed_count }}</strong> |
+          Waitlist: <strong>{{ live_participation.waitlist_count }}</strong>
+        </p>
+        {% if user.member and (active_vote.id in voting_open_ids or (live_user_vote and live_user_vote.will_join and active_vote.event_start > now)) %}
+        <div class="inline-group">
+          {% if active_vote.id in voting_open_ids %}
+          <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=active_vote.id) }}" class="inline-form">
+            <input type="hidden" name="will_join" value="1" />
+            <button type="submit">I will join</button>
+          </form>
+          {% endif %}
+          <form method="post" action="{{ url_for('web.vote_appointment', appointment_id=active_vote.id) }}" class="inline-form">
+            <input type="hidden" name="will_join" value="0" />
+            <button type="submit" class="secondary">{{ 'Cancel My Spot' if live_user_vote and live_user_vote.will_join and active_vote.id not in voting_open_ids else 'I cannot join' }}</button>
+          </form>
+        </div>
+        {% endif %}
+        <p class="muted">Confirmed now: {{ live_participation.confirmed_names | join(', ') if live_participation.confirmed_names else 'No confirmed players yet' }}</p>
+        <p class="muted">Waitlist: {{ live_participation.waitlist_names | join(', ') if live_participation.waitlist_names else 'None' }}</p>
+      </article>
+      {% endfor %}
     </section>
     {% endif %}
 

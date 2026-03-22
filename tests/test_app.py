@@ -366,6 +366,42 @@ def test_three_player_exception_keeps_one_court_and_allows_late_join(session):
     assert participation.confirmed_names == ["A", "B", "C", "D"]
 
 
+def test_dashboard_shows_current_week_vote_before_extended_vote(session, client):
+    admin = session.query(User).filter_by(username="admin").one()
+    members = [_mk_member(session, name) for name in ["A", "B", "C"]]
+    session.commit()
+
+    _set_now(session, "2022-01-01T18:30:00")
+    run_maintenance(session)
+    session.commit()
+
+    jan11 = _get_appointment_by_date(session, datetime(2022, 1, 11, 20, 0, 0))
+    base_time = datetime(2022, 1, 2, 10, 0, 0)
+    for idx, member in enumerate(members, start=1):
+        _set_vote(session, jan11.id, member.id, True, base_time + timedelta(minutes=idx))
+    session.commit()
+
+    _set_now(session, "2022-01-03T19:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    _set_now(session, "2022-01-09T10:00:00")
+    run_maintenance(session)
+    session.commit()
+
+    with client.session_transaction() as flask_session:
+        flask_session["user_id"] = admin.id
+
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert "Current Week Vote" in html
+    assert "Extended Vote" in html
+    assert "Club Play 2022-01-18" in html
+    assert "Club Play 2022-01-11" in html
+    assert html.index("Current Week Vote") < html.index("Extended Vote")
+
+
 def test_auto_match_plan_and_notification_on_vote_close(session):
     members = [_mk_member(session, f"N{i}", rating=900 + i * 25) for i in range(1, 9)]
     session.commit()
